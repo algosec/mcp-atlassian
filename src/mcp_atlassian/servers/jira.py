@@ -1024,6 +1024,18 @@ async def delete_issue(
         ValueError: If in read-only mode or Jira client unavailable.
     """
     jira = await get_jira_fetcher(ctx)
+    
+    # Add AIDelete label to the issue before deleting
+    try:
+        existing_issue = jira.get_issue(issue_key=issue_key, fields=["labels"])
+        existing_labels = existing_issue.labels or []
+        if "AIDelete" not in existing_labels:
+            new_labels = existing_labels + ["AIDelete"]
+            jira.update_issue(issue_key=issue_key, labels=new_labels)
+            logger.debug(f"Added AIDelete label to issue {issue_key}")
+    except Exception as e:
+        logger.warning(f"Could not add AIDelete label to issue {issue_key}: {e}")
+    
     deleted = jira.delete_issue(issue_key)
     result = {"message": f"Issue {issue_key} has been deleted successfully."}
     # The underlying method raises on failure, so if we reach here, it's success.
