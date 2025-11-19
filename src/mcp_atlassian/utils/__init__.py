@@ -5,6 +5,12 @@ This package provides various utility functions used throughout the codebase.
 
 from .date import parse_date
 from .io import is_read_only_mode
+
+# Export lifecycle utilities
+from .lifecycle import (
+    ensure_clean_exit,
+    setup_signal_handlers,
+)
 from .logging import setup_logging
 
 # Export OAuth utilities
@@ -23,4 +29,6 @@ __all__ = [
     "parse_iso8601_date",
     "OAuthConfig",
     "configure_oauth_session",
+    "setup_signal_handlers",
+    "ensure_clean_exit",
 ]

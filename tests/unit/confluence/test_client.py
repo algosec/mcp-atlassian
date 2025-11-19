@@ -3,6 +3,7 @@
 import os
 from unittest.mock import MagicMock, patch
 
+from mcp_atlassian.confluence import ConfluenceFetcher
 from mcp_atlassian.confluence.client import ConfluenceClient
 from mcp_atlassian.confluence.config import ConfluenceConfig
 
@@ -56,7 +57,7 @@ def test_init_with_token_auth():
     # Arrange
     config = ConfluenceConfig(
         url="https://confluence.example.com",
-        auth_type="token",
+        auth_type="pat",
         personal_token="test_personal_token",
         ssl_verify=False,
     )
@@ -140,7 +141,7 @@ def test_process_html_content():
 
         # Assert
         mock_preprocessor.process_html_content.assert_called_once_with(
-            "<p>Test</p>", "TEST"
+            "<p>Test</p>", "TEST", client.confluence
         )
         assert html == "<p>HTML</p>"
         assert markdown == "Markdown"
@@ -163,7 +164,7 @@ def test_get_user_details_by_accountid():
             "active": True,
         }
 
-        client = ConfluenceClient()
+        client = ConfluenceFetcher()
 
         # Act
         user_details = client.get_user_details_by_accountid("123456")

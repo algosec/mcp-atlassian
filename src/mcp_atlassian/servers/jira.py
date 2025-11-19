@@ -2,16 +2,22 @@
 
 import json
 import logging
+import os
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
+from requests.exceptions import HTTPError
 
+from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
 from mcp_atlassian.jira.constants import DEFAULT_READ_JIRA_FIELDS
-
-from .context import MainAppContext
+from mcp_atlassian.models.jira.common import JiraUser
+from mcp_atlassian.servers.dependencies import get_jira_fetcher
+from mcp_atlassian.utils.decorators import check_write_access
 
 logger = logging.getLogger(__name__)
+
+
 
 jira_mcp = FastMCP(
     name="Jira MCP Service",
@@ -20,15 +26,74 @@ jira_mcp = FastMCP(
 
 
 @jira_mcp.tool(tags={"jira", "read"})
+async def get_user_profile(
+    ctx: Context,
+    user_identifier: Annotated[
+        str,
+        Field(
+            description="Identifier for the user (e.g., email address 'user@example.com', username 'johndoe', account ID 'accountid:...', or key for Server/DC)."
+        ),
+    ],
+) -> str:
+    """
+    Retrieve profile information for a specific Jira user.
+
+    Args:
+        ctx: The FastMCP context.
+        user_identifier: User identifier (email, username, key, or account ID).
+
+    Returns:
+        JSON string representing the Jira user profile object, or an error object if not found.
+
+    Raises:
+        ValueError: If the Jira client is not configured or available.
+    """
+    jira = await get_jira_fetcher(ctx)
+    try:
+        user: JiraUser = jira.get_user_profile_by_identifier(user_identifier)
+        result = user.to_simplified_dict()
+        response_data = {"success": True, "user": result}
+    except Exception as e:
+        error_message = ""
+        log_level = logging.ERROR
+        if isinstance(e, ValueError) and "not found" in str(e).lower():
+            log_level = logging.WARNING
+            error_message = str(e)
+        elif isinstance(e, MCPAtlassianAuthenticationError):
+            error_message = f"Authentication/Permission Error: {str(e)}"
+        elif isinstance(e, OSError | HTTPError):
+            error_message = f"Network or API Error: {str(e)}"
+        else:
+            error_message = (
+                "An unexpected error occurred while fetching the user profile."
+            )
+            logger.exception(
+                f"Unexpected error in get_user_profile for '{user_identifier}':"
+            )
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "user_identifier": user_identifier,
+        }
+        logger.log(
+            log_level,
+            f"get_user_profile failed for '{user_identifier}': {error_message}",
+        )
+        response_data = error_result
+    return json.dumps(response_data, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "read"})
 async def get_issue(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
     fields: Annotated[
-        str | None,
+        str,
         Field(
             description=(
-                "Fields to return. Can be a comma-separated list (e.g., 'summary,status,customfield_10010'), "
-                "'*all' for all fields (including custom fields), or omitted for essential fields only."
+                "(Optional) Comma-separated list of fields to return (e.g., 'summary,status,customfield_10010'). "
+                "You may also provide a single field as a string (e.g., 'duedate'). "
+                "Use '*all' for all fields (including custom fields), or omit for essential fields only."
             ),
             default=",".join(DEFAULT_READ_JIRA_FIELDS),
         ),
@@ -37,7 +102,7 @@ async def get_issue(
         str | None,
         Field(
             description=(
-                "Optional fields to expand. Examples: 'renderedFields' (for rendered content), "
+                "(Optional) Fields to expand. Examples: 'renderedFields' (for rendered content), "
                 "'transitions' (for available status transitions), 'changelog' (for history)"
             ),
             default=None,
@@ -55,7 +120,7 @@ async def get_issue(
     properties: Annotated[
         str | None,
         Field(
-            description="A comma-separated list of issue properties to return",
+            description="(Optional) A comma-separated list of issue properties to return",
             default=None,
         ),
     ] = None,
@@ -72,7 +137,7 @@ async def get_issue(
     Args:
         ctx: The FastMCP context.
         issue_key: Jira issue key.
-        fields: Fields to return.
+        fields: Comma-separated list of fields to return (e.g., 'summary,status,customfield_10010'), a single field as a string (e.g., 'duedate'), '*all' for all fields, or omitted for essentials.
         expand: Optional fields to expand.
         comment_limit: Maximum number of comments.
         properties: Issue properties to return.
@@ -80,12 +145,11 @@ async def get_issue(
 
     Returns:
         JSON string representing the Jira issue object.
-    """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
 
+    Raises:
+        ValueError: If the Jira client is not configured or available.
+    """
+    jira = await get_jira_fetcher(ctx)
     fields_list: str | list[str] | None = fields
     if fields and fields != "*all":
         fields_list = [f.strip() for f in fields.split(",")]
@@ -104,7 +168,7 @@ async def get_issue(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def search(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     jql: Annotated[
         str,
         Field(
@@ -121,10 +185,10 @@ async def search(
         ),
     ],
     fields: Annotated[
-        str | None,
+        str,
         Field(
             description=(
-                "Comma-separated fields to return in the results. "
+                "(Optional) Comma-separated fields to return in the results. "
                 "Use '*all' for all fields, or specify individual fields like 'summary,status,assignee,priority'"
             ),
             default=",".join(DEFAULT_READ_JIRA_FIELDS),
@@ -142,16 +206,17 @@ async def search(
         str | None,
         Field(
             description=(
-                "Comma-separated list of project keys to filter results by. "
+                "(Optional) Comma-separated list of project keys to filter results by. "
                 "Overrides the environment variable JIRA_PROJECTS_FILTER if provided."
             ),
+            default=None,
         ),
     ] = None,
     expand: Annotated[
         str | None,
         Field(
             description=(
-                "Optional fields to expand. Examples: 'renderedFields', 'transitions', 'changelog'"
+                "(Optional) fields to expand. Examples: 'renderedFields', 'transitions', 'changelog'"
             ),
             default=None,
         ),
@@ -171,11 +236,7 @@ async def search(
     Returns:
         JSON string representing the search results including pagination info.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     fields_list: str | list[str] | None = fields
     if fields and fields != "*all":
         fields_list = [f.strip() for f in fields.split(",")]
@@ -194,7 +255,7 @@ async def search(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def search_fields(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     keyword: Annotated[
         str,
         Field(
@@ -221,18 +282,14 @@ async def search_fields(
     Returns:
         JSON string representing a list of matching field definitions.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     result = jira.search_fields(keyword, limit=limit, refresh=refresh)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_project_issues(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     project_key: Annotated[str, Field(description="The project key")],
     limit: Annotated[
         int,
@@ -254,11 +311,7 @@ async def get_project_issues(
     Returns:
         JSON string representing the search results including pagination info.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     search_result = jira.get_project_issues(
         project_key=project_key, start=start_at, limit=limit
     )
@@ -268,7 +321,7 @@ async def get_project_issues(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_transitions(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
 ) -> str:
     """Get available status transitions for a Jira issue.
@@ -280,11 +333,7 @@ async def get_transitions(
     Returns:
         JSON string representing a list of available transitions.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     # Underlying method returns list[dict] in the desired format
     transitions = jira.get_available_transitions(issue_key)
     return json.dumps(transitions, indent=2, ensure_ascii=False)
@@ -292,7 +341,7 @@ async def get_transitions(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_worklog(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
 ) -> str:
     """Get worklog entries for a Jira issue.
@@ -304,11 +353,7 @@ async def get_worklog(
     Returns:
         JSON string representing the worklog entries.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     worklogs = jira.get_worklogs(issue_key)
     result = {"worklogs": worklogs}
     return json.dumps(result, indent=2, ensure_ascii=False)
@@ -316,7 +361,7 @@ async def get_worklog(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def download_attachments(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
     target_dir: Annotated[
         str, Field(description="Directory where attachments should be saved")
@@ -332,27 +377,26 @@ async def download_attachments(
     Returns:
         JSON string indicating the result of the download operation.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     result = jira.download_issue_attachments(issue_key=issue_key, target_dir=target_dir)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_agile_boards(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     board_name: Annotated[
-        str | None, Field(description="The name of board, support fuzzy search")
+        str | None,
+        Field(description="(Optional) The name of board, support fuzzy search"),
     ] = None,
     project_key: Annotated[
-        str | None, Field(description="Jira project key (e.g., 'PROJ-123')")
+        str | None, Field(description="(Optional) Jira project key (e.g., 'PROJ-123')")
     ] = None,
     board_type: Annotated[
         str | None,
-        Field(description="The type of jira board (e.g., 'scrum', 'kanban')"),
+        Field(
+            description="(Optional) The type of jira board (e.g., 'scrum', 'kanban')"
+        ),
     ] = None,
     start_at: Annotated[
         int,
@@ -376,11 +420,7 @@ async def get_agile_boards(
     Returns:
         JSON string representing a list of board objects.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     boards = jira.get_all_agile_boards_model(
         board_name=board_name,
         project_key=project_key,
@@ -394,7 +434,7 @@ async def get_agile_boards(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_board_issues(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     board_id: Annotated[str, Field(description="The id of the board (e.g., '1001')")],
     jql: Annotated[
         str,
@@ -412,7 +452,7 @@ async def get_board_issues(
         ),
     ],
     fields: Annotated[
-        str | None,
+        str,
         Field(
             description=(
                 "Comma-separated fields to return in the results. "
@@ -431,7 +471,7 @@ async def get_board_issues(
         Field(description="Maximum number of results (1-50)", default=10, ge=1, le=50),
     ] = 10,
     expand: Annotated[
-        str | None,
+        str,
         Field(
             description="Optional fields to expand in the response (e.g., 'changelog').",
             default="version",
@@ -452,11 +492,7 @@ async def get_board_issues(
     Returns:
         JSON string representing the search results including pagination info.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     fields_list: str | list[str] | None = fields
     if fields and fields != "*all":
         fields_list = [f.strip() for f in fields.split(",")]
@@ -475,7 +511,7 @@ async def get_board_issues(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_sprints_from_board(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     board_id: Annotated[str, Field(description="The id of board (e.g., '1000')")],
     state: Annotated[
         str | None,
@@ -502,11 +538,7 @@ async def get_sprints_from_board(
     Returns:
         JSON string representing a list of sprint objects.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     sprints = jira.get_all_sprints_from_board_model(
         board_id=board_id, state=state, start=start_at, limit=limit
     )
@@ -516,10 +548,10 @@ async def get_sprints_from_board(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_sprint_issues(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     sprint_id: Annotated[str, Field(description="The id of sprint (e.g., '10001')")],
     fields: Annotated[
-        str | None,
+        str,
         Field(
             description=(
                 "Comma-separated fields to return in the results. "
@@ -550,11 +582,7 @@ async def get_sprint_issues(
     Returns:
         JSON string representing the search results including pagination info.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     fields_list: str | list[str] | None = fields
     if fields and fields != "*all":
         fields_list = [f.strip() for f in fields.split(",")]
@@ -567,7 +595,7 @@ async def get_sprint_issues(
 
 
 @jira_mcp.tool(tags={"jira", "read"})
-async def get_link_types(ctx: Context[Any, MainAppContext]) -> str:
+async def get_link_types(ctx: Context) -> str:
     """Get all available issue link types.
 
     Args:
@@ -576,19 +604,16 @@ async def get_link_types(ctx: Context[Any, MainAppContext]) -> str:
     Returns:
         JSON string representing a list of issue link type objects.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     link_types = jira.get_issue_link_types()
     formatted_link_types = [link_type.to_simplified_dict() for link_type in link_types]
     return json.dumps(formatted_link_types, indent=2, ensure_ascii=False)
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def create_issue(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     project_key: Annotated[
         str,
         Field(
@@ -607,23 +632,23 @@ async def create_issue(
                 "Issue type (e.g. 'Task', 'Bug', 'Story', 'Epic', 'Subtask'). "
                 "The available types depend on your project configuration. "
                 "For subtasks, use 'Subtask' (not 'Sub-task') and include parent in additional_fields."
-            )
+            ),
         ),
     ],
     assignee: Annotated[
         str | None,
         Field(
-            description="Assignee of the ticket (accountID, full name or e-mail)",
+            description="(Optional) Assignee's user identifier (string): Email, display name, or account ID (e.g., 'user@example.com', 'John Doe', 'accountid:...')",
             default=None,
         ),
     ] = None,
     description: Annotated[
-        str, Field(description="Issue description", default="")
-    ] = "",
+        str | None, Field(description="Issue description", default=None)
+    ] = None,
     components: Annotated[
         str | None,
         Field(
-            description="Comma-separated list of component names to assign (e.g., 'Frontend,API')",
+            description="(Optional) Comma-separated list of component names to assign (e.g., 'Frontend,API')",
             default=None,
         ),
     ] = None,
@@ -631,7 +656,7 @@ async def create_issue(
         dict[str, Any] | None,
         Field(
             description=(
-                "Optional dictionary of additional fields to set. Examples:\n"
+                "(Optional) Dictionary of additional fields to set. Examples:\n"
                 "- Set priority: {'priority': {'name': 'High'}}\n"
                 "- Add labels: {'labels': ['frontend', 'urgent']}\n"
                 "- Link to parent (for any issue type): {'parent': 'PROJ-123'}\n"
@@ -649,7 +674,7 @@ async def create_issue(
         project_key: The JIRA project key.
         summary: Summary/title of the issue.
         issue_type: Issue type (e.g., 'Task', 'Bug', 'Story', 'Epic', 'Subtask').
-        assignee: Assignee of the ticket (accountID, full name or e-mail).
+        assignee: Assignee's user identifier (string): Email, display name, or account ID (e.g., 'user@example.com', 'John Doe', 'accountid:...').
         description: Issue description.
         components: Comma-separated list of component names.
         additional_fields: Dictionary of additional fields.
@@ -660,14 +685,7 @@ async def create_issue(
     Raises:
         ValueError: If in read-only mode or Jira client is unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call create_issue in read-only mode.")
-        raise ValueError("Cannot create issue in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     # Parse components from comma-separated string to list
     components_list = None
     if components and isinstance(components, str):
@@ -680,11 +698,31 @@ async def create_issue(
     if not isinstance(extra_fields, dict):
         raise ValueError("additional_fields must be a dictionary.")
 
+    # Append AI attribution to description if provided
+    ai_description = description
+    if ai_description:
+        ai_description = f"{description}\n\nCreated by Algosec AI"
+    
+    # Add AICreate label
+    if "labels" in extra_fields:
+        # If labels already exist in extra_fields, append to them
+        if isinstance(extra_fields["labels"], list):
+            if "AICreate" not in extra_fields["labels"]:
+                extra_fields["labels"].append("AICreate")
+        else:
+            # Convert to list if it's not already
+            extra_fields["labels"] = [extra_fields["labels"], "AICreate"]
+    else:
+        # Create new labels list with AICreate
+        extra_fields["labels"] = ["AICreate"]
+    
+    logger.debug("Adding AICreate label to issue")
+
     issue = jira.create_issue(
         project_key=project_key,
         summary=summary,
         issue_type=issue_type,
-        description=description,
+        description=ai_description,
         assignee=assignee,
         components=components_list,
         **extra_fields,
@@ -698,8 +736,9 @@ async def create_issue(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def batch_create_issues(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issues: Annotated[
         str,
         Field(
@@ -739,14 +778,7 @@ async def batch_create_issues(
     Raises:
         ValueError: If in read-only mode, Jira client unavailable, or invalid JSON.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call batch_create_issues in read-only mode.")
-        raise ValueError("Cannot create issues in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     # Parse issues from JSON string
     try:
         issues_list = json.loads(issues)
@@ -774,7 +806,7 @@ async def batch_create_issues(
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def batch_get_changelogs(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_ids_or_keys: Annotated[
         list[str],
         Field(
@@ -784,7 +816,7 @@ async def batch_get_changelogs(
     fields: Annotated[
         list[str] | None,
         Field(
-            description="Filter the changelogs by fields, e.g. ['status', 'assignee']. Default to [] for all fields.",
+            description="(Optional) Filter the changelogs by fields, e.g. ['status', 'assignee']. Default to None for all fields.",
             default=None,
         ),
     ] = None,
@@ -816,11 +848,7 @@ async def batch_get_changelogs(
         NotImplementedError: If run on Jira Server/Data Center.
         ValueError: If Jira client is unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     # Ensure this runs only on Cloud, as per original function docstring
     if not jira.config.is_cloud:
         raise NotImplementedError(
@@ -849,23 +877,23 @@ async def batch_get_changelogs(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def update_issue(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
     fields: Annotated[
         dict[str, Any],
         Field(
             description=(
-                "A valid dictionary of fields to update. "
-                "Example: {'summary': 'New title', 'description': 'Updated description', "
-                "'priority': {'name': 'High'}, 'assignee': 'john.doe'}"
+                "Dictionary of fields to update. For 'assignee', provide a string identifier (email, name, or accountId). "
+                "Example: `{'assignee': 'user@example.com', 'summary': 'New Summary'}`"
             )
         ),
     ],
     additional_fields: Annotated[
         dict[str, Any] | None,
         Field(
-            description="Optional dictionary of additional fields to update. Use this for custom fields or more complex updates.",
+            description="(Optional) Dictionary of additional fields to update. Use this for custom fields or more complex updates.",
             default=None,
         ),
     ] = None,
@@ -873,7 +901,7 @@ async def update_issue(
         str | None,
         Field(
             description=(
-                "Optional JSON string array or comma-separated list of file paths to attach to the issue. "
+                "(Optional) JSON string array or comma-separated list of file paths to attach to the issue. "
                 "Example: '/path/to/file1.txt,/path/to/file2.txt' or ['/path/to/file1.txt','/path/to/file2.txt']"
             ),
             default=None,
@@ -893,25 +921,46 @@ async def update_issue(
         JSON string representing the updated issue object and attachment results.
 
     Raises:
-        ValueError: If in read-only mode, Jira client unavailable, or invalid input.
+        ValueError: If in read-only mode or Jira client unavailable, or invalid input.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call update_issue in read-only mode.")
-        raise ValueError("Cannot update issue in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     # Use fields directly as dict
     if not isinstance(fields, dict):
         raise ValueError("fields must be a dictionary.")
     update_fields = fields
 
+    # Append AI attribution to description if it's being updated
+    if "description" in update_fields and update_fields["description"]:
+        update_fields["description"] = f"{update_fields['description']}\n\nUpdated by Algosec AI"
+
     # Use additional_fields directly as dict
     extra_fields = additional_fields or {}
     if not isinstance(extra_fields, dict):
         raise ValueError("additional_fields must be a dictionary.")
+    
+    # Add AIUpdate label
+    if "labels" in extra_fields:
+        # If labels already exist in extra_fields, append to them
+        if isinstance(extra_fields["labels"], list):
+            if "AIUpdate" not in extra_fields["labels"]:
+                extra_fields["labels"].append("AIUpdate")
+        else:
+            # Convert to list if it's not already
+            extra_fields["labels"] = [extra_fields["labels"], "AIUpdate"]
+    else:
+        # Get existing labels from the issue
+        try:
+            existing_issue = jira.get_issue(issue_key=issue_key, fields=["labels"])
+            existing_labels = existing_issue.labels or []
+            if "AIUpdate" not in existing_labels:
+                extra_fields["labels"] = existing_labels + ["AIUpdate"]
+            else:
+                extra_fields["labels"] = existing_labels
+        except Exception as e:
+            logger.debug(f"Could not fetch existing labels, creating new label list: {e}")
+            extra_fields["labels"] = ["AIUpdate"]
+    
+    logger.debug("Adding AIUpdate label to issue")
 
     # Parse attachments
     attachment_paths = []
@@ -957,8 +1006,9 @@ async def update_issue(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def delete_issue(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g. PROJ-123)")],
 ) -> str:
     """Delete an existing Jira issue.
@@ -973,14 +1023,7 @@ async def delete_issue(
     Raises:
         ValueError: If in read-only mode or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call delete_issue in read-only mode.")
-        raise ValueError("Cannot delete issue in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     deleted = jira.delete_issue(issue_key)
     result = {"message": f"Issue {issue_key} has been deleted successfully."}
     # The underlying method raises on failure, so if we reach here, it's success.
@@ -988,8 +1031,9 @@ async def delete_issue(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def add_comment(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
     comment: Annotated[str, Field(description="Comment text in Markdown format")],
 ) -> str:
@@ -1006,22 +1050,30 @@ async def add_comment(
     Raises:
         ValueError: If in read-only mode or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call add_comment in read-only mode.")
-        raise ValueError("Cannot add comment in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
+    # Append AI attribution to comment
+    ai_comment = f"{comment}\n\nCommented by Algosec AI"
     # add_comment returns dict
-    result = jira.add_comment(issue_key, comment)
+    result = jira.add_comment(issue_key, ai_comment)
+    
+    # Add AIComment label to the issue
+    try:
+        existing_issue = jira.get_issue(issue_key=issue_key, fields=["labels"])
+        existing_labels = existing_issue.labels or []
+        if "AIComment" not in existing_labels:
+            new_labels = existing_labels + ["AIComment"]
+            jira.update_issue(issue_key=issue_key, labels=new_labels)
+            logger.debug("Added AIComment label to issue")
+    except Exception as e:
+        logger.warning(f"Could not add AIComment label to issue {issue_key}: {e}")
+    
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def add_worklog(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
     time_spent: Annotated[
         str,
@@ -1034,23 +1086,23 @@ async def add_worklog(
     ],
     comment: Annotated[
         str | None,
-        Field(description="Optional comment for the worklog in Markdown format"),
+        Field(description="(Optional) Comment for the worklog in Markdown format"),
     ] = None,
     started: Annotated[
         str | None,
         Field(
             description=(
-                "Optional start time in ISO format. If not provided, the current time will be used. "
+                "(Optional) Start time in ISO format. If not provided, the current time will be used. "
                 "Example: '2023-08-01T12:00:00.000+0000'"
             )
         ),
     ] = None,
     # Add original_estimate and remaining_estimate as per original tool
     original_estimate: Annotated[
-        str | None, Field(description="Optional new value for the original estimate")
+        str | None, Field(description="(Optional) New value for the original estimate")
     ] = None,
     remaining_estimate: Annotated[
-        str | None, Field(description="Optional new value for the remaining estimate")
+        str | None, Field(description="(Optional) New value for the remaining estimate")
     ] = None,
 ) -> str:
     """Add a worklog entry to a Jira issue.
@@ -1071,14 +1123,7 @@ async def add_worklog(
     Raises:
         ValueError: If in read-only mode or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call add_worklog in read-only mode.")
-        raise ValueError("Cannot add worklog in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     # add_worklog returns dict
     worklog_result = jira.add_worklog(
         issue_key=issue_key,
@@ -1093,8 +1138,9 @@ async def add_worklog(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def link_to_epic(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[
         str, Field(description="The key of the issue to link (e.g., 'PROJ-123')")
     ],
@@ -1115,14 +1161,7 @@ async def link_to_epic(
     Raises:
         ValueError: If in read-only mode or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call link_to_epic in read-only mode.")
-        raise ValueError("Cannot link issue to epic in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     issue = jira.link_issue_to_epic(issue_key, epic_key)
     result = {
         "message": f"Issue {issue_key} has been linked to epic {epic_key}.",
@@ -1132,8 +1171,9 @@ async def link_to_epic(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def create_issue_link(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     link_type: Annotated[
         str,
         Field(
@@ -1147,12 +1187,12 @@ async def create_issue_link(
         str, Field(description="The key of the outward issue (e.g., 'PROJ-456')")
     ],
     comment: Annotated[
-        str | None, Field(description="Optional comment to add to the link")
+        str | None, Field(description="(Optional) Comment to add to the link")
     ] = None,
     comment_visibility: Annotated[
         dict[str, str] | None,
         Field(
-            description="Optional visibility settings for the comment (e.g., {'type': 'group', 'value': 'jira-users'})",
+            description="(Optional) Visibility settings for the comment (e.g., {'type': 'group', 'value': 'jira-users'})",
             default=None,
         ),
     ] = None,
@@ -1173,14 +1213,7 @@ async def create_issue_link(
     Raises:
         ValueError: If required fields are missing, invalid input, in read-only mode, or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call create_issue_link in read-only mode.")
-        raise ValueError("Cannot create issue link in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     if not all([link_type, inward_issue_key, outward_issue_key]):
         raise ValueError(
             "link_type, inward_issue_key, and outward_issue_key are required."
@@ -1206,8 +1239,91 @@ async def create_issue_link(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
+async def create_remote_issue_link(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(description="The key of the issue to add the link to (e.g., 'PROJ-123')"),
+    ],
+    url: Annotated[
+        str,
+        Field(
+            description="The URL to link to (e.g., 'https://example.com/page' or Confluence page URL)"
+        ),
+    ],
+    title: Annotated[
+        str,
+        Field(
+            description="The title/name of the link (e.g., 'Documentation Page', 'Confluence Page')"
+        ),
+    ],
+    summary: Annotated[
+        str | None, Field(description="(Optional) Description of the link")
+    ] = None,
+    relationship: Annotated[
+        str | None,
+        Field(
+            description="(Optional) Relationship description (e.g., 'causes', 'relates to', 'documentation')"
+        ),
+    ] = None,
+    icon_url: Annotated[
+        str | None, Field(description="(Optional) URL to a 16x16 icon for the link")
+    ] = None,
+) -> str:
+    """Create a remote issue link (web link or Confluence link) for a Jira issue.
+
+    This tool allows you to add web links and Confluence links to Jira issues.
+    The links will appear in the issue's "Links" section and can be clicked to navigate to external resources.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: The key of the issue to add the link to.
+        url: The URL to link to (can be any web page or Confluence page).
+        title: The title/name that will be displayed for the link.
+        summary: Optional description of what the link is for.
+        relationship: Optional relationship description.
+        icon_url: Optional URL to a 16x16 icon for the link.
+
+    Returns:
+        JSON string indicating success or failure.
+
+    Raises:
+        ValueError: If required fields are missing, invalid input, in read-only mode, or Jira client unavailable.
+    """
+    jira = await get_jira_fetcher(ctx)
+    if not issue_key:
+        raise ValueError("issue_key is required.")
+    if not url:
+        raise ValueError("url is required.")
+    if not title:
+        raise ValueError("title is required.")
+
+    # Build the remote link data structure
+    link_object = {
+        "url": url,
+        "title": title,
+    }
+
+    if summary:
+        link_object["summary"] = summary
+
+    if icon_url:
+        link_object["icon"] = {"url16x16": icon_url, "title": title}
+
+    link_data = {"object": link_object}
+
+    if relationship:
+        link_data["relationship"] = relationship
+
+    result = jira.create_remote_issue_link(issue_key, link_data)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def remove_issue_link(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     link_id: Annotated[str, Field(description="The ID of the link to remove")],
 ) -> str:
     """Remove a link between two Jira issues.
@@ -1222,14 +1338,7 @@ async def remove_issue_link(
     Raises:
         ValueError: If link_id is missing, in read-only mode, or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call remove_issue_link in read-only mode.")
-        raise ValueError("Cannot remove issue link in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     if not link_id:
         raise ValueError("link_id is required")
 
@@ -1238,8 +1347,9 @@ async def remove_issue_link(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def transition_issue(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
     transition_id: Annotated[
         str,
@@ -1254,7 +1364,7 @@ async def transition_issue(
         dict[str, Any] | None,
         Field(
             description=(
-                "Optional dictionary of fields to update during the transition. "
+                "(Optional) Dictionary of fields to update during the transition. "
                 "Some transitions require specific fields to be set (e.g., resolution). "
                 "Example: {'resolution': {'name': 'Fixed'}}"
             ),
@@ -1265,7 +1375,7 @@ async def transition_issue(
         str | None,
         Field(
             description=(
-                "Comment to add during the transition (optional). "
+                "(Optional) Comment to add during the transition. "
                 "This will be visible in the issue history."
             ),
         ),
@@ -1286,14 +1396,7 @@ async def transition_issue(
     Raises:
         ValueError: If required fields missing, invalid input, in read-only mode, or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call transition_issue in read-only mode.")
-        raise ValueError("Cannot transition issue in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     if not issue_key or not transition_id:
         raise ValueError("issue_key and transition_id are required.")
 
@@ -1317,8 +1420,9 @@ async def transition_issue(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def create_sprint(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     board_id: Annotated[str, Field(description="The id of board (e.g., '1000')")],
     sprint_name: Annotated[
         str, Field(description="Name of the sprint (e.g., 'Sprint 1')")
@@ -1329,7 +1433,9 @@ async def create_sprint(
     end_date: Annotated[
         str, Field(description="End time for sprint (ISO 8601 format)")
     ],
-    goal: Annotated[str | None, Field(description="Goal of the sprint")] = None,
+    goal: Annotated[
+        str | None, Field(description="(Optional) Goal of the sprint")
+    ] = None,
 ) -> str:
     """Create Jira sprint for a board.
 
@@ -1347,14 +1453,7 @@ async def create_sprint(
     Raises:
         ValueError: If in read-only mode or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call create_sprint in read-only mode.")
-        raise ValueError("Cannot create sprint in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     sprint = jira.create_sprint(
         board_id=board_id,
         sprint_name=sprint_name,
@@ -1366,24 +1465,25 @@ async def create_sprint(
 
 
 @jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
 async def update_sprint(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     sprint_id: Annotated[str, Field(description="The id of sprint (e.g., '10001')")],
     sprint_name: Annotated[
-        str | None, Field(description="Optional: New name for the sprint")
+        str | None, Field(description="(Optional) New name for the sprint")
     ] = None,
     state: Annotated[
         str | None,
-        Field(description="Optional: New state for the sprint (future|active|closed)"),
+        Field(description="(Optional) New state for the sprint (future|active|closed)"),
     ] = None,
     start_date: Annotated[
-        str | None, Field(description="Optional: New start date for the sprint")
+        str | None, Field(description="(Optional) New start date for the sprint")
     ] = None,
     end_date: Annotated[
-        str | None, Field(description="Optional: New end date for the sprint")
+        str | None, Field(description="(Optional) New end date for the sprint")
     ] = None,
     goal: Annotated[
-        str | None, Field(description="Optional: New goal for the sprint")
+        str | None, Field(description="(Optional) New goal for the sprint")
     ] = None,
 ) -> str:
     """Update jira sprint.
@@ -1403,14 +1503,7 @@ async def update_sprint(
     Raises:
         ValueError: If in read-only mode or Jira client unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call update_sprint in read-only mode.")
-        raise ValueError("Cannot update sprint in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        raise ValueError("Jira client is not configured or available.")
-    jira = lifespan_ctx.jira
-
+    jira = await get_jira_fetcher(ctx)
     sprint = jira.update_sprint(
         sprint_id=sprint_id,
         sprint_name=sprint_name,
@@ -1427,3 +1520,201 @@ async def update_sprint(
         return json.dumps(error_payload, indent=2, ensure_ascii=False)
     else:
         return json.dumps(sprint.to_simplified_dict(), indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "read"})
+async def get_project_versions(
+    ctx: Context,
+    project_key: Annotated[str, Field(description="Jira project key (e.g., 'PROJ')")],
+) -> str:
+    """Get all fix versions for a specific Jira project."""
+    jira = await get_jira_fetcher(ctx)
+    versions = jira.get_project_versions(project_key)
+    return json.dumps(versions, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "read"})
+async def get_all_projects(
+    ctx: Context,
+    include_archived: Annotated[
+        bool,
+        Field(
+            description="Whether to include archived projects in the results",
+            default=False,
+        ),
+    ] = False,
+) -> str:
+    """Get all Jira projects accessible to the current user.
+
+    Args:
+        ctx: The FastMCP context.
+        include_archived: Whether to include archived projects.
+
+    Returns:
+        JSON string representing a list of project objects accessible to the user.
+        Project keys are always returned in uppercase.
+        If JIRA_PROJECTS_FILTER is configured, only returns projects matching those keys.
+
+    Raises:
+        ValueError: If the Jira client is not configured or available.
+    """
+    try:
+        jira = await get_jira_fetcher(ctx)
+        projects = jira.get_all_projects(include_archived=include_archived)
+    except (MCPAtlassianAuthenticationError, HTTPError, OSError, ValueError) as e:
+        error_message = ""
+        log_level = logging.ERROR
+        if isinstance(e, MCPAtlassianAuthenticationError):
+            error_message = f"Authentication/Permission Error: {str(e)}"
+        elif isinstance(e, OSError | HTTPError):
+            error_message = f"Network or API Error: {str(e)}"
+        elif isinstance(e, ValueError):
+            error_message = f"Configuration Error: {str(e)}"
+
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.log(log_level, f"get_all_projects failed: {error_message}")
+        return json.dumps(error_result, indent=2, ensure_ascii=False)
+
+    # Ensure all project keys are uppercase
+    for project in projects:
+        if "key" in project:
+            project["key"] = project["key"].upper()
+
+    # Apply project filter if configured
+    if jira.config.projects_filter:
+        # Split projects filter by commas and handle possible whitespace
+        allowed_project_keys = {
+            p.strip().upper() for p in jira.config.projects_filter.split(",")
+        }
+        projects = [
+            project
+            for project in projects
+            if project.get("key") in allowed_project_keys
+        ]
+
+    return json.dumps(projects, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "write"})
+@check_write_access
+async def create_version(
+    ctx: Context,
+    project_key: Annotated[str, Field(description="Jira project key (e.g., 'PROJ')")],
+    name: Annotated[str, Field(description="Name of the version")],
+    start_date: Annotated[
+        str | None, Field(description="Start date (YYYY-MM-DD)", default=None)
+    ] = None,
+    release_date: Annotated[
+        str | None, Field(description="Release date (YYYY-MM-DD)", default=None)
+    ] = None,
+    description: Annotated[
+        str | None, Field(description="Description of the version", default=None)
+    ] = None,
+) -> str:
+    """Create a new fix version in a Jira project.
+
+    Args:
+        ctx: The FastMCP context.
+        project_key: The project key.
+        name: Name of the version.
+        start_date: Start date (optional).
+        release_date: Release date (optional).
+        description: Description (optional).
+
+    Returns:
+        JSON string of the created version object.
+    """
+    jira = await get_jira_fetcher(ctx)
+    try:
+        version = jira.create_project_version(
+            project_key=project_key,
+            name=name,
+            start_date=start_date,
+            release_date=release_date,
+            description=description,
+        )
+        return json.dumps(version, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(
+            f"Error creating version in project {project_key}: {str(e)}", exc_info=True
+        )
+        return json.dumps(
+            {"success": False, "error": str(e)}, indent=2, ensure_ascii=False
+        )
+
+
+@jira_mcp.tool(name="batch_create_versions", tags={"jira", "write"})
+@check_write_access
+async def batch_create_versions(
+    ctx: Context,
+    project_key: Annotated[str, Field(description="Jira project key (e.g., 'PROJ')")],
+    versions: Annotated[
+        str,
+        Field(
+            description=(
+                "JSON array of version objects. Each object should contain:\n"
+                "- name (required): Name of the version\n"
+                "- startDate (optional): Start date (YYYY-MM-DD)\n"
+                "- releaseDate (optional): Release date (YYYY-MM-DD)\n"
+                "- description (optional): Description of the version\n"
+                "Example: [\n"
+                '  {"name": "v1.0", "startDate": "2025-01-01", "releaseDate": "2025-02-01", "description": "First release"},\n'
+                '  {"name": "v2.0"}\n'
+                "]"
+            )
+        ),
+    ],
+) -> str:
+    """Batch create multiple versions in a Jira project.
+
+    Args:
+        ctx: The FastMCP context.
+        project_key: The project key.
+        versions: JSON array string of version objects.
+
+    Returns:
+        JSON array of results, each with success flag, version or error.
+    """
+    jira = await get_jira_fetcher(ctx)
+    try:
+        version_list = json.loads(versions)
+        if not isinstance(version_list, list):
+            raise ValueError("Input 'versions' must be a JSON array string.")
+    except json.JSONDecodeError:
+        raise ValueError("Invalid JSON in versions")
+    except Exception as e:
+        raise ValueError(f"Invalid input for versions: {e}") from e
+
+    results = []
+    if not version_list:
+        return json.dumps(results, indent=2, ensure_ascii=False)
+
+    for idx, v in enumerate(version_list):
+        # Defensive: ensure v is a dict and has a name
+        if not isinstance(v, dict) or not v.get("name"):
+            results.append(
+                {
+                    "success": False,
+                    "error": f"Item {idx}: Each version must be an object with at least a 'name' field.",
+                }
+            )
+            continue
+        try:
+            version = jira.create_project_version(
+                project_key=project_key,
+                name=v["name"],
+                start_date=v.get("startDate"),
+                release_date=v.get("releaseDate"),
+                description=v.get("description"),
+            )
+            results.append({"success": True, "version": version})
+        except Exception as e:
+            logger.error(
+                f"Error creating version in batch for project {project_key}: {str(e)}",
+                exc_info=True,
+            )
+            results.append({"success": False, "error": str(e), "input": v})
+    return json.dumps(results, indent=2, ensure_ascii=False)

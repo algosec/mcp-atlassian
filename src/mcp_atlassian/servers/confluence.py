@@ -2,14 +2,21 @@
 
 import json
 import logging
-from typing import Annotated, Any
+import os
+from typing import Annotated
 
 from fastmcp import Context, FastMCP
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
-from .context import MainAppContext
+from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
+from mcp_atlassian.servers.dependencies import get_confluence_fetcher
+from mcp_atlassian.utils.decorators import (
+    check_write_access,
+)
 
 logger = logging.getLogger(__name__)
+
+
 
 confluence_mcp = FastMCP(
     name="Confluence MCP Service",
@@ -19,7 +26,7 @@ confluence_mcp = FastMCP(
 
 @confluence_mcp.tool(tags={"confluence", "read"})
 async def search(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     query: Annotated[
         str,
         Field(
@@ -58,9 +65,11 @@ async def search(
         str | None,
         Field(
             description=(
-                "Comma-separated list of space keys to filter results by. "
-                "Overrides the environment variable CONFLUENCE_SPACES_FILTER if provided."
+                "(Optional) Comma-separated list of space keys to filter results by. "
+                "Overrides the environment variable CONFLUENCE_SPACES_FILTER if provided. "
+                "Use empty string to disable filtering."
             ),
+            default=None,
         ),
     ] = None,
 ) -> str:
@@ -75,11 +84,7 @@ async def search(
     Returns:
         JSON string representing a list of simplified Confluence page objects.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
-
+    confluence_fetcher = await get_confluence_fetcher(ctx)
     # Check if the query is a simple search term or already a CQL query
     if query and not any(
         x in query for x in ["=", "~", ">", "<", " AND ", " OR ", "currentUser()"]
@@ -90,36 +95,61 @@ async def search(
             logger.info(
                 f"Converting simple search term to CQL using siteSearch: {query}"
             )
-            pages = confluence.search(query, limit=limit, spaces_filter=spaces_filter)
+            pages = confluence_fetcher.search(
+                query, limit=limit, spaces_filter=spaces_filter
+            )
         except Exception as e:
             logger.warning(f"siteSearch failed ('{e}'), falling back to text search.")
             query = f'text ~ "{original_query}"'
             logger.info(f"Falling back to text search with CQL: {query}")
-            pages = confluence.search(query, limit=limit, spaces_filter=spaces_filter)
+            pages = confluence_fetcher.search(
+                query, limit=limit, spaces_filter=spaces_filter
+            )
     else:
-        pages = confluence.search(query, limit=limit, spaces_filter=spaces_filter)
-
+        pages = confluence_fetcher.search(
+            query, limit=limit, spaces_filter=spaces_filter
+        )
     search_results = [page.to_simplified_dict() for page in pages]
     return json.dumps(search_results, indent=2, ensure_ascii=False)
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
 async def get_page(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     page_id: Annotated[
-        str,
+        str | None,
         Field(
             description=(
                 "Confluence page ID (numeric ID, can be found in the page URL). "
                 "For example, in the URL 'https://example.atlassian.net/wiki/spaces/TEAM/pages/123456789/Page+Title', "
-                "the page ID is '123456789'"
-            )
+                "the page ID is '123456789'. "
+                "Provide this OR both 'title' and 'space_key'. If page_id is provided, title and space_key will be ignored."
+            ),
+            default=None,
         ),
-    ],
+    ] = None,
+    title: Annotated[
+        str | None,
+        Field(
+            description=(
+                "The exact title of the Confluence page. Use this with 'space_key' if 'page_id' is not known."
+            ),
+            default=None,
+        ),
+    ] = None,
+    space_key: Annotated[
+        str | None,
+        Field(
+            description=(
+                "The key of the Confluence space where the page resides (e.g., 'DEV', 'TEAM'). Required if using 'title'."
+            ),
+            default=None,
+        ),
+    ] = None,
     include_metadata: Annotated[
         bool,
         Field(
-            description="Whether to include page metadata such as creation date, last update, version, and labels",
+            description="Whether to include page metadata such as creation date, last update, version, and labels.",
             default=True,
         ),
     ] = True,
@@ -135,35 +165,73 @@ async def get_page(
         ),
     ] = True,
 ) -> str:
-    """Get content of a specific Confluence page by ID.
+    """Get content of a specific Confluence page by its ID, or by its title and space key.
 
     Args:
         ctx: The FastMCP context.
-        page_id: Confluence page ID.
+        page_id: Confluence page ID. If provided, 'title' and 'space_key' are ignored.
+        title: The exact title of the page. Must be used with 'space_key'.
+        space_key: The key of the space. Must be used with 'title'.
         include_metadata: Whether to include page metadata.
         convert_to_markdown: Convert content to markdown (true) or keep raw HTML (false).
 
     Returns:
-        JSON string representing the page content and/or metadata.
+        JSON string representing the page content and/or metadata, or an error if not found or parameters are invalid.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+    page_object = None
 
-    page = confluence.get_page_content(page_id, convert_to_markdown=convert_to_markdown)
+    if page_id:
+        if title or space_key:
+            logger.warning(
+                "page_id was provided; title and space_key parameters will be ignored."
+            )
+        try:
+            page_object = confluence_fetcher.get_page_content(
+                page_id, convert_to_markdown=convert_to_markdown
+            )
+        except Exception as e:
+            logger.error(f"Error fetching page by ID '{page_id}': {e}")
+            return json.dumps(
+                {"error": f"Failed to retrieve page by ID '{page_id}': {e}"},
+                indent=2,
+                ensure_ascii=False,
+            )
+    elif title and space_key:
+        page_object = confluence_fetcher.get_page_by_title(
+            space_key, title, convert_to_markdown=convert_to_markdown
+        )
+        if not page_object:
+            return json.dumps(
+                {
+                    "error": f"Page with title '{title}' not found in space '{space_key}'."
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+    else:
+        raise ValueError(
+            "Either 'page_id' OR both 'title' and 'space_key' must be provided."
+        )
+
+    if not page_object:
+        return json.dumps(
+            {"error": "Page not found with the provided identifiers."},
+            indent=2,
+            ensure_ascii=False,
+        )
 
     if include_metadata:
-        result = {"metadata": page.to_simplified_dict()}
+        result = {"metadata": page_object.to_simplified_dict()}
     else:
-        result = {"content": page.content}
+        result = {"content": {"value": page_object.content}}
 
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
 async def get_page_children(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     parent_id: Annotated[
         str,
         Field(
@@ -219,16 +287,12 @@ async def get_page_children(
     Returns:
         JSON string representing a list of child page objects.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
-
+    confluence_fetcher = await get_confluence_fetcher(ctx)
     if include_content and "body" not in expand:
         expand = f"{expand},body.storage" if expand else "body.storage"
 
     try:
-        pages = confluence.get_page_children(
+        pages = confluence_fetcher.get_page_children(
             page_id=parent_id,
             start=start,
             limit=limit,
@@ -255,7 +319,7 @@ async def get_page_children(
 
 @confluence_mcp.tool(tags={"confluence", "read"})
 async def get_comments(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     page_id: Annotated[
         str,
         Field(
@@ -276,19 +340,15 @@ async def get_comments(
     Returns:
         JSON string representing a list of comment objects.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
-
-    comments = confluence.get_page_comments(page_id)
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+    comments = confluence_fetcher.get_page_comments(page_id)
     formatted_comments = [comment.to_simplified_dict() for comment in comments]
     return json.dumps(formatted_comments, indent=2, ensure_ascii=False)
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
 async def get_labels(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     page_id: Annotated[
         str,
         Field(
@@ -309,19 +369,16 @@ async def get_labels(
     Returns:
         JSON string representing a list of label objects.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
-
-    labels = confluence.get_page_labels(page_id)
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+    labels = confluence_fetcher.get_page_labels(page_id)
     formatted_labels = [label.to_simplified_dict() for label in labels]
     return json.dumps(formatted_labels, indent=2, ensure_ascii=False)
 
 
 @confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
 async def add_label(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     page_id: Annotated[str, Field(description="The ID of the page to update")],
     name: Annotated[str, Field(description="The name of the label")],
 ) -> str:
@@ -338,22 +395,16 @@ async def add_label(
     Raises:
         ValueError: If in read-only mode or Confluence client is unavailable.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call add_label in read-only mode.")
-        raise ValueError("Cannot add label in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
-
-    labels = confluence.add_page_label(page_id, name)
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+    labels = confluence_fetcher.add_page_label(page_id, name)
     formatted_labels = [label.to_simplified_dict() for label in labels]
     return json.dumps(formatted_labels, indent=2, ensure_ascii=False)
 
 
 @confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
 async def create_page(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     space_key: Annotated[
         str,
         Field(
@@ -364,15 +415,31 @@ async def create_page(
     content: Annotated[
         str,
         Field(
-            description="The content of the page in Markdown format. Supports headings, lists, tables, code blocks, and other Markdown syntax"
+            description="The content of the page. Format depends on content_format parameter. Can be Markdown (default), wiki markup, or storage format"
         ),
     ],
     parent_id: Annotated[
         str | None,
         Field(
-            description="Optional parent page ID. If provided, this page will be created as a child of the specified page"
+            description="(Optional) parent page ID. If provided, this page will be created as a child of the specified page",
+            default=None,
         ),
+        BeforeValidator(lambda x: str(x) if x is not None else None),
     ] = None,
+    content_format: Annotated[
+        str,
+        Field(
+            description="(Optional) The format of the content parameter. Options: 'markdown' (default), 'wiki', or 'storage'. Wiki format uses Confluence wiki markup syntax",
+            default="markdown",
+        ),
+    ] = "markdown",
+    enable_heading_anchors: Annotated[
+        bool,
+        Field(
+            description="(Optional) Whether to enable automatic heading anchor generation. Only applies when content_format is 'markdown'",
+            default=False,
+        ),
+    ] = False,
 ) -> str:
     """Create a new Confluence page.
 
@@ -380,29 +447,46 @@ async def create_page(
         ctx: The FastMCP context.
         space_key: The key of the space.
         title: The title of the page.
-        content: The content in Markdown format.
+        content: The content of the page (format depends on content_format).
         parent_id: Optional parent page ID.
+        content_format: The format of the content ('markdown', 'wiki', or 'storage').
+        enable_heading_anchors: Whether to enable heading anchors (markdown only).
 
     Returns:
         JSON string representing the created page object.
 
     Raises:
-        ValueError: If in read-only mode or Confluence client is unavailable.
+        ValueError: If in read-only mode, Confluence client is unavailable, or invalid content_format.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call create_page in read-only mode.")
-        raise ValueError("Cannot create page in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
+    confluence_fetcher = await get_confluence_fetcher(ctx)
 
-    page = confluence.create_page(
+    # Validate content_format
+    if content_format not in ["markdown", "wiki", "storage"]:
+        raise ValueError(
+            f"Invalid content_format: {content_format}. Must be 'markdown', 'wiki', or 'storage'"
+        )
+
+    # Append AI attribution to content
+    ai_content = f"{content}\n\nCreated By Algosec AI"
+    
+    # Determine parameters based on content format
+    if content_format == "markdown":
+        is_markdown = True
+        content_representation = None  # Will be converted to storage
+    else:
+        is_markdown = False
+        content_representation = content_format  # Pass 'wiki' or 'storage' directly
+
+    page = confluence_fetcher.create_page(
         space_key=space_key,
         title=title,
-        body=content,
+        body=ai_content,
         parent_id=parent_id,
-        is_markdown=True,
+        is_markdown=is_markdown,
+        enable_heading_anchors=enable_heading_anchors
+        if content_format == "markdown"
+        else False,
+        content_representation=content_representation,
     )
     result = page.to_simplified_dict()
     return json.dumps(
@@ -413,22 +497,42 @@ async def create_page(
 
 
 @confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
 async def update_page(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     page_id: Annotated[str, Field(description="The ID of the page to update")],
     title: Annotated[str, Field(description="The new title of the page")],
     content: Annotated[
-        str, Field(description="The new content of the page in Markdown format")
+        str,
+        Field(
+            description="The new content of the page. Format depends on content_format parameter"
+        ),
     ],
     is_minor_edit: Annotated[
         bool, Field(description="Whether this is a minor edit", default=False)
     ] = False,
     version_comment: Annotated[
-        str, Field(description="Optional comment for this version", default="")
-    ] = "",
-    parent_id: Annotated[
-        str | None, Field(description="Optional the new parent page ID")
+        str | None, Field(description="Optional comment for this version", default=None)
     ] = None,
+    parent_id: Annotated[
+        str | None,
+        Field(description="Optional the new parent page ID", default=None),
+        BeforeValidator(lambda x: str(x) if x is not None else None),
+    ] = None,
+    content_format: Annotated[
+        str,
+        Field(
+            description="(Optional) The format of the content parameter. Options: 'markdown' (default), 'wiki', or 'storage'. Wiki format uses Confluence wiki markup syntax",
+            default="markdown",
+        ),
+    ] = "markdown",
+    enable_heading_anchors: Annotated[
+        bool,
+        Field(
+            description="(Optional) Whether to enable automatic heading anchor generation. Only applies when content_format is 'markdown'",
+            default=False,
+        ),
+    ] = False,
 ) -> str:
     """Update an existing Confluence page.
 
@@ -436,33 +540,56 @@ async def update_page(
         ctx: The FastMCP context.
         page_id: The ID of the page to update.
         title: The new title of the page.
-        content: The new content in Markdown format.
+        content: The new content of the page (format depends on content_format).
         is_minor_edit: Whether this is a minor edit.
         version_comment: Optional comment for this version.
         parent_id: Optional new parent page ID.
+        content_format: The format of the content ('markdown', 'wiki', or 'storage').
+        enable_heading_anchors: Whether to enable heading anchors (markdown only).
 
     Returns:
         JSON string representing the updated page object.
 
     Raises:
-        ValueError: If in read-only mode or Confluence client is unavailable.
+        ValueError: If Confluence client is not configured, available, or invalid content_format.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call update_page in read-only mode.")
-        raise ValueError("Cannot update page in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
+    confluence_fetcher = await get_confluence_fetcher(ctx)
 
-    updated_page = confluence.update_page(
+    # Validate content_format
+    if content_format not in ["markdown", "wiki", "storage"]:
+        raise ValueError(
+            f"Invalid content_format: {content_format}. Must be 'markdown', 'wiki', or 'storage'"
+        )
+
+    # Append AI attribution to content
+    ai_content = f"{content}\n\nUpdated by Algosec AI"
+    
+    # Add AI attribution to version comment
+    if version_comment:
+        ai_version_comment = f"{version_comment} - Modified by Algosec AI"
+    else:
+        ai_version_comment = "Modified by Algosec AI"
+    
+    # Determine parameters based on content format
+    if content_format == "markdown":
+        is_markdown = True
+        content_representation = None  # Will be converted to storage
+    else:
+        is_markdown = False
+        content_representation = content_format  # Pass 'wiki' or 'storage' directly
+
+    updated_page = confluence_fetcher.update_page(
         page_id=page_id,
         title=title,
-        body=content,
+        body=ai_content,
         is_minor_edit=is_minor_edit,
-        version_comment=version_comment,
-        is_markdown=True,
+        version_comment=ai_version_comment,
+        is_markdown=is_markdown,
         parent_id=parent_id,
+        enable_heading_anchors=enable_heading_anchors
+        if content_format == "markdown"
+        else False,
+        content_representation=content_representation,
     )
     page_data = updated_page.to_simplified_dict()
     return json.dumps(
@@ -473,8 +600,9 @@ async def update_page(
 
 
 @confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
 async def delete_page(
-    ctx: Context[Any, MainAppContext],
+    ctx: Context,
     page_id: Annotated[str, Field(description="The ID of the page to delete")],
 ) -> str:
     """Delete an existing Confluence page.
@@ -487,18 +615,11 @@ async def delete_page(
         JSON string indicating success or failure.
 
     Raises:
-        ValueError: If in read-only mode or Confluence client is unavailable.
+        ValueError: If Confluence client is not configured or available.
     """
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if lifespan_ctx.read_only:
-        logger.warning("Attempted to call delete_page in read-only mode.")
-        raise ValueError("Cannot delete page in read-only mode.")
-    if not lifespan_ctx or not lifespan_ctx.confluence:
-        raise ValueError("Confluence client is not configured or available.")
-    confluence = lifespan_ctx.confluence
-
+    confluence_fetcher = await get_confluence_fetcher(ctx)
     try:
-        result = confluence.delete_page(page_id=page_id)
+        result = confluence_fetcher.delete_page(page_id=page_id)
         if result:
             response = {
                 "success": True,
@@ -518,3 +639,126 @@ async def delete_page(
         }
 
     return json.dumps(response, indent=2, ensure_ascii=False)
+
+
+@confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
+async def add_comment(
+    ctx: Context,
+    page_id: Annotated[
+        str, Field(description="The ID of the page to add a comment to")
+    ],
+    content: Annotated[
+        str, Field(description="The comment content in Markdown format")
+    ],
+) -> str:
+    """Add a comment to a Confluence page.
+
+    Args:
+        ctx: The FastMCP context.
+        page_id: The ID of the page to add a comment to.
+        content: The comment content in Markdown format.
+
+    Returns:
+        JSON string representing the created comment.
+
+    Raises:
+        ValueError: If in read-only mode or Confluence client is unavailable.
+    """
+    # Add AI attribution to content before passing to mixin
+    ai_content = f"{content}\n\nCommented by Algosec AI"
+    
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+    try:
+        comment = confluence_fetcher.add_comment(page_id=page_id, content=ai_content)
+        if comment:
+            comment_data = comment.to_simplified_dict()
+            response = {
+                "success": True,
+                "message": "Comment added successfully",
+                "comment": comment_data,
+            }
+        else:
+            response = {
+                "success": False,
+                "message": f"Unable to add comment to page {page_id}. API request completed but comment creation unsuccessful.",
+            }
+    except Exception as e:
+        logger.error(f"Error adding comment to Confluence page {page_id}: {str(e)}")
+        response = {
+            "success": False,
+            "message": f"Error adding comment to page {page_id}",
+            "error": str(e),
+        }
+
+    return json.dumps(response, indent=2, ensure_ascii=False)
+
+
+@confluence_mcp.tool(tags={"confluence", "read"})
+async def search_user(
+    ctx: Context,
+    query: Annotated[
+        str,
+        Field(
+            description=(
+                "Search query - a CQL query string for user search. "
+                "Examples of CQL:\n"
+                "- Basic user lookup by full name: 'user.fullname ~ \"First Last\"'\n"
+                'Note: Special identifiers need proper quoting in CQL: personal space keys (e.g., "~username"), '
+                "reserved words, numeric IDs, and identifiers with special characters."
+            )
+        ),
+    ],
+    limit: Annotated[
+        int,
+        Field(
+            description="Maximum number of results (1-50)",
+            default=10,
+            ge=1,
+            le=50,
+        ),
+    ] = 10,
+) -> str:
+    """Search Confluence users using CQL.
+
+    Args:
+        ctx: The FastMCP context.
+        query: Search query - a CQL query string for user search.
+        limit: Maximum number of results (1-50).
+
+    Returns:
+        JSON string representing a list of simplified Confluence user search result objects.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # If the query doesn't look like CQL, wrap it as a user fullname search
+    if query and not any(
+        x in query for x in ["=", "~", ">", "<", " AND ", " OR ", "user."]
+    ):
+        # Simple search term - search by fullname
+        query = f'user.fullname ~ "{query}"'
+        logger.info(f"Converting simple search term to user CQL: {query}")
+
+    try:
+        user_results = confluence_fetcher.search_user(query, limit=limit)
+        search_results = [user.to_simplified_dict() for user in user_results]
+        return json.dumps(search_results, indent=2, ensure_ascii=False)
+    except MCPAtlassianAuthenticationError as e:
+        logger.error(f"Authentication error during user search: {e}", exc_info=False)
+        return json.dumps(
+            {
+                "error": "Authentication failed. Please check your credentials.",
+                "details": str(e),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        logger.error(f"Error searching users: {str(e)}")
+        return json.dumps(
+            {
+                "error": f"An unexpected error occurred while searching for users: {str(e)}"
+            },
+            indent=2,
+            ensure_ascii=False,
+        )

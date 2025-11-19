@@ -23,24 +23,22 @@ def preprocessor_with_jira():
 
 @pytest.fixture
 def preprocessor_with_confluence():
-    return ConfluencePreprocessor(
-        base_url="https://example.atlassian.net",
-        confluence_client=MockConfluenceClient(),
-    )
+    return ConfluencePreprocessor(base_url="https://example.atlassian.net")
 
 
 def test_init():
     """Test JiraPreprocessor initialization."""
     processor = JiraPreprocessor("https://example.atlassian.net/")
     assert processor.base_url == "https://example.atlassian.net"
-    assert processor.confluence_client is None
 
 
 def test_process_confluence_page_content(preprocessor_with_confluence):
     """Test processing Confluence page content using mock data."""
     html_content = MOCK_PAGE_RESPONSE["body"]["storage"]["value"]
     processed_html, processed_markdown = (
-        preprocessor_with_confluence.process_html_content(html_content)
+        preprocessor_with_confluence.process_html_content(
+            html_content, confluence_client=MockConfluenceClient()
+        )
     )
 
     # Verify user mention is processed
@@ -56,7 +54,9 @@ def test_process_confluence_comment_content(preprocessor_with_confluence):
     """Test processing Confluence comment content using mock data."""
     html_content = MOCK_COMMENTS_RESPONSE["results"][0]["body"]["view"]["value"]
     processed_html, processed_markdown = (
-        preprocessor_with_confluence.process_html_content(html_content)
+        preprocessor_with_confluence.process_html_content(
+            html_content, confluence_client=MockConfluenceClient()
+        )
     )
 
     assert "Comment content here" in processed_markdown
@@ -80,7 +80,9 @@ def test_process_html_content_basic(preprocessor_with_confluence):
     """Test basic HTML content processing."""
     html = "<p>Simple text</p>"
     processed_html, processed_markdown = (
-        preprocessor_with_confluence.process_html_content(html)
+        preprocessor_with_confluence.process_html_content(
+            html, confluence_client=MockConfluenceClient()
+        )
     )
 
     assert processed_html == "<p>Simple text</p>"
@@ -96,7 +98,9 @@ def test_process_html_content_with_user_mentions(preprocessor_with_confluence):
     <p>Some text</p>
     """
     processed_html, processed_markdown = (
-        preprocessor_with_confluence.process_html_content(html)
+        preprocessor_with_confluence.process_html_content(
+            html, confluence_client=MockConfluenceClient()
+        )
     )
 
     assert "@Test User 123456" in processed_html
@@ -157,7 +161,9 @@ def test_clean_jira_text_combined(preprocessor_with_jira):
 def test_process_html_content_error_handling(preprocessor_with_confluence):
     """Test error handling in process_html_content."""
     with pytest.raises(Exception):
-        preprocessor_with_confluence.process_html_content(None)
+        preprocessor_with_confluence.process_html_content(
+            None, confluence_client=MockConfluenceClient()
+        )
 
 
 def test_clean_jira_text_with_invalid_html(preprocessor_with_jira):
@@ -308,3 +314,198 @@ This is some **bold** and *italic* text.
     assert "<em>" in storage_format or "<i>" in storage_format  # Italic
     assert "<a href=" in storage_format.lower()  # Link
     assert "example.com" in storage_format
+
+
+def test_process_confluence_profile_macro(preprocessor_with_confluence):
+    """Test processing Confluence User Profile Macro in page content."""
+    html_content = MOCK_PAGE_RESPONSE["body"]["storage"]["value"]
+    processed_html, processed_markdown = (
+        preprocessor_with_confluence.process_html_content(
+            html_content, confluence_client=MockConfluenceClient()
+        )
+    )
+    # Should replace macro with @Test User user123
+    assert "@Test User user123" in processed_html
+    assert "@Test User user123" in processed_markdown
+
+
+def test_process_confluence_profile_macro_malformed(preprocessor_with_confluence):
+    """Test processing malformed User Profile Macro (missing user param and ri:user)."""
+    # Macro missing ac:parameter
+    html_missing_param = '<ac:structured-macro ac:name="profile"></ac:structured-macro>'
+    processed_html, processed_markdown = (
+        preprocessor_with_confluence.process_html_content(
+            html_missing_param, confluence_client=MockConfluenceClient()
+        )
+    )
+    assert "[User Profile Macro (Malformed)]" in processed_html
+    assert "[User Profile Macro (Malformed)]" in processed_markdown
+
+    # Macro with ac:parameter but missing ri:user
+    html_missing_riuser = '<ac:structured-macro ac:name="profile"><ac:parameter ac:name="user"></ac:parameter></ac:structured-macro>'
+    processed_html, processed_markdown = (
+        preprocessor_with_confluence.process_html_content(
+            html_missing_riuser, confluence_client=MockConfluenceClient()
+        )
+    )
+    assert "[User Profile Macro (Malformed)]" in processed_html
+    assert "[User Profile Macro (Malformed)]" in processed_markdown
+
+
+def test_process_confluence_profile_macro_fallback():
+    """Test fallback when confluence_client is None."""
+    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+
+    html = (
+        '<ac:structured-macro ac:name="profile">'
+        '<ac:parameter ac:name="user">'
+        '<ri:user ri:account-id="user999" />'
+        "</ac:parameter>"
+        "</ac:structured-macro>"
+    )
+    preprocessor = ConfluencePreprocessor(base_url="https://example.atlassian.net")
+    processed_html, processed_markdown = preprocessor.process_html_content(
+        html, confluence_client=None
+    )
+    assert "[User Profile: user999]" in processed_html
+    assert "[User Profile: user999]" in processed_markdown
+
+
+def test_process_user_profile_macro_multiple():
+    """Test processing multiple User Profile Macros with account-id and userkey."""
+    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+
+    html = (
+        "<p>This page mentions a user via profile macro: "
+        '<ac:structured-macro ac:name="profile" ac:schema-version="1">'
+        '<ac:parameter ac:name="user">'
+        '<ri:user ri:account-id="test-account-id-123" />'
+        "</ac:parameter>"
+        "</ac:structured-macro>. "
+        "And another one: "
+        '<ac:structured-macro ac:name="profile" ac:schema-version="1">'
+        '<ac:parameter ac:name="user">'
+        '<ri:user ri:userkey="test-userkey-456" />'
+        "</ac:parameter>"
+        "</ac:structured-macro>."
+        "</p>"
+    )
+
+    class CustomMockConfluenceClient:
+        def get_user_details_by_accountid(self, account_id):
+            return (
+                {"displayName": "Test User One"}
+                if account_id == "test-account-id-123"
+                else {}
+            )
+
+        def get_user_details_by_username(self, username):
+            return (
+                {"displayName": "Test User Two"}
+                if username == "test-userkey-456"
+                else {}
+            )
+
+    preprocessor = ConfluencePreprocessor(base_url="https://example.atlassian.net")
+    processed_html, processed_markdown = preprocessor.process_html_content(
+        html, confluence_client=CustomMockConfluenceClient()
+    )
+    assert "@Test User One" in processed_html
+    assert "@Test User Two" in processed_html
+    assert "@Test User One" in processed_markdown
+    assert "@Test User Two" in processed_markdown
+
+
+def test_markdown_to_confluence_no_automatic_anchors():
+    """Test that heading_anchors=False prevents automatic anchor generation (regression for issue #488)."""
+    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+
+    markdown_with_headings = """
+# Main Title
+Some content here.
+
+## Subsection
+More content.
+
+### Deep Section
+Final content.
+"""
+
+    preprocessor = ConfluencePreprocessor(base_url="https://example.atlassian.net")
+    result = preprocessor.markdown_to_confluence_storage(markdown_with_headings)
+
+    # Should not contain automatically generated anchor IDs
+    assert 'id="main-title"' not in result.lower()
+    assert 'id="subsection"' not in result.lower()
+    assert 'id="deep-section"' not in result.lower()
+
+    # Should still contain proper heading tags
+    assert "<h1>Main Title</h1>" in result
+    assert "<h2>Subsection</h2>" in result
+    assert "<h3>Deep Section</h3>" in result
+
+
+def test_markdown_to_confluence_style_preservation():
+    """Test that styled content is preserved during conversion."""
+    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+
+    markdown_with_styles = """
+# Title with **bold** text
+
+This paragraph has *italic* and **bold** text.
+
+```python
+def hello():
+    return "world"
+```
+
+- Item with **bold**
+- Item with *italic*
+
+> Blockquote with **formatting**
+
+[Link text](https://example.com) with description.
+"""
+
+    preprocessor = ConfluencePreprocessor(base_url="https://example.atlassian.net")
+    result = preprocessor.markdown_to_confluence_storage(markdown_with_styles)
+
+    # Check that formatting is preserved
+    assert "<strong>bold</strong>" in result
+    assert "<em>italic</em>" in result
+    assert "<blockquote>" in result
+    assert '<a href="https://example.com">Link text</a>' in result
+    assert "ac:structured-macro" in result  # Code block macro
+    assert 'ac:name="code"' in result
+    assert "python" in result
+
+
+def test_markdown_to_confluence_optional_anchor_generation():
+    """Test that enable_heading_anchors parameter controls anchor generation."""
+    from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
+
+    markdown_with_headings = """
+# Main Title
+Content here.
+
+## Subsection
+More content.
+"""
+
+    preprocessor = ConfluencePreprocessor(base_url="https://example.atlassian.net")
+
+    # Test with anchors disabled (default)
+    result_no_anchors = preprocessor.markdown_to_confluence_storage(
+        markdown_with_headings
+    )
+    assert 'id="main-title"' not in result_no_anchors.lower()
+    assert 'id="subsection"' not in result_no_anchors.lower()
+
+    # Test with anchors enabled
+    result_with_anchors = preprocessor.markdown_to_confluence_storage(
+        markdown_with_headings, enable_heading_anchors=True
+    )
+    # When anchors are enabled, they should be present
+    # Note: md2conf may use different anchor formats, so we check for presence of id attributes
+    assert "<h1>" in result_with_anchors
+    assert "<h2>" in result_with_anchors
