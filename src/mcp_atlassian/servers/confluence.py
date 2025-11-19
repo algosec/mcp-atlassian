@@ -641,6 +641,19 @@ async def delete_page(
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
     try:
+        # Add AIDelete label before deleting the page
+        try:
+            # Get existing labels
+            existing_labels = confluence_fetcher.get_page_labels(page_id)
+            existing_label_names = [label.name for label in existing_labels]
+            
+            # Only add if not already present
+            if "AIDelete" not in existing_label_names:
+                confluence_fetcher.add_page_label(page_id, "AIDelete")
+                logger.debug(f"Added AIDelete label to page {page_id}")
+        except Exception as e:
+            logger.warning(f"Could not add AIDelete label to page {page_id}: {e}")
+        
         result = confluence_fetcher.delete_page(page_id=page_id)
         if result:
             response = {
